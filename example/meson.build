@@ -37,4 +37,10 @@ if not platform.endswith('bsd') and platform != 'dragonfly' and add_languages('c
                install: false)
 endif
 
+if not platform.endswith('bsd') and platform != 'dragonfly' and add_languages('cpp', required : false)
+    executable('passthrough_hplog', 'passthrough_hplog.cc',
+               dependencies: [ thread_dep, libfuse_dep ],
+               install: false)
+endif
+
 # TODO: Link passthrough_fh with ulockmgr if available

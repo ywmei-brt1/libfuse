@@ -40,7 +40,7 @@
  * satisfy if it can't read the file in the underlying filesystem).
  *
  * ## Source code ##
- * \include passthrough_hp.cc
+ * \include passthrough_hplog.cc
  */
 
 #define FUSE_USE_VERSION FUSE_MAKE_VERSION(3, 12)
@@ -69,9 +69,22 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <list>
 #include "cxxopts.hpp"
 #include <mutex>
-#include <syslog.h>
+#include <fstream>
+#include <thread>
+#include <iomanip>
+
+// Extra includes
+#include <iostream>
+#include <ctime>
+#include <chrono> // Include for std::chrono
+#include <sstream> // Include for std::ostringstream
+#include <unordered_set> // Include for std::unordered_set
+#include <mutex> // Include for std::mutex
+#include <sys/stat.h> // Include for stat()
+
 
 using namespace std;
 
@@ -93,11 +106,15 @@ struct Inode;
 static Inode& get_inode(fuse_ino_t ino);
 static void forget_one(fuse_ino_t ino, uint64_t n);
 
+// Global hash set and mutex
+std::unordered_set<std::string> loggedFilePaths;
+std::mutex loggedFilePathsMutex;
+
 // Uniquely identifies a file in the source directory tree. This could
 // be simplified to just ino_t since we require the source directory
 // not to contain any mountpoints. This hasn't been done yet in case
 // we need to reconsider this constraint (but relaxing this would have
-// the drawback that we can no longer reuse inode numbers, and thus
+// the drawback that we can no longer re-use inode numbers, and thus
 // readdir() would need to do a full lookup() in order to report the
 // right inode number).
 typedef std::pair<ino_t, dev_t> SrcId;
@@ -120,7 +137,6 @@ struct Inode {
     dev_t src_dev {0};
     ino_t src_ino {0};
     int generation {0};
-    int backing_id {0};
     uint64_t nopen {0};
     uint64_t nlookup {0};
     std::mutex m;
@@ -157,7 +173,6 @@ struct Fs {
     bool clone_fd;
     std::string fuse_mount_options;
     bool direct_io;
-    bool passthrough;
 };
 static Fs fs{};
 
@@ -189,23 +204,10 @@ static int get_fs_fd(fuse_ino_t ino) {
 
 static void sfs_init(void *userdata, fuse_conn_info *conn) {
     (void)userdata;
+    if (conn->capable & FUSE_CAP_EXPORT_SUPPORT)
+        conn->want |= FUSE_CAP_EXPORT_SUPPORT;
 
-    if (fs.passthrough && conn->capable & FUSE_CAP_PASSTHROUGH) {
-        conn->want |= FUSE_CAP_PASSTHROUGH;
-        if (fs.debug) {
-            std::cerr << "DEBUG: sfs_init(): fs.passthrough is true, using passthrough" << std::endl;
-        }
-	}
-    else {
-        fs.passthrough = false;
-        if (fs.debug) {
-            std::cerr << "DEBUG: sfs_init(): fs.passthrough is false, NOT using passthrough" << std::endl;
-        }
-	}
-
-    /* Passthrough and writeback cache are conflicting modes */
-    if (fs.timeout && !fs.passthrough &&
-        conn->capable & FUSE_CAP_WRITEBACK_CACHE)
+    if (fs.timeout && conn->capable & FUSE_CAP_WRITEBACK_CACHE)
         conn->want |= FUSE_CAP_WRITEBACK_CACHE;
 
     if (conn->capable & FUSE_CAP_FLOCK_LOCKS)
@@ -224,22 +226,15 @@ static void sfs_init(void *userdata, fuse_conn_info *conn) {
         if (conn->capable & FUSE_CAP_SPLICE_READ)
             conn->want |= FUSE_CAP_SPLICE_READ;
     }
-
-    /* This is a local file system - no network coherency needed */
-    if (conn->capable & FUSE_CAP_DIRECT_IO_ALLOW_MMAP)
-        conn->want |= FUSE_CAP_DIRECT_IO_ALLOW_MMAP;
-
-    /* Disable the receiving and processing of FUSE_INTERRUPT requests */
-    conn->no_interrupt = 1;
 }
 
 
-static void sfs_getattr(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi)
-{
+static void sfs_getattr(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi) {
+    (void)fi;
+    Inode& inode = get_inode(ino);
     struct stat attr;
-    int fd = fi ? fi->fh : get_inode(ino).fd;
-
-    auto res = fstatat(fd, "", &attr, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
+    auto res = fstatat(inode.fd, "", &attr,
+                       AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
     if (res == -1) {
         fuse_reply_err(req, errno);
         return;
@@ -739,7 +734,6 @@ static void do_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
     }
 
     while (1) {
-        bool did_lookup = false;
         struct dirent *entry;
         errno = 0;
         entry = readdir(d->dp);
@@ -753,21 +747,15 @@ static void do_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
             break; // End of stream
         }
         d->offset = entry->d_off;
+        if (is_dot_or_dotdot(entry->d_name))
+            continue;
 
         fuse_entry_param e{};
         size_t entsize;
         if (plus) {
-            if (is_dot_or_dotdot(entry->d_name)) {
-                /* fuse kernel ignores attributes for these and also does
-                 * not increase lookup count (see fuse_direntplus_link) */
-                e.attr.st_ino = entry->d_ino;
-                e.attr.st_mode = entry->d_type << 12;
-            } else {
-                err = do_lookup(ino, entry->d_name, &e);
-                if (err)
-                    goto error;
-                did_lookup = true;
-            }
+            err = do_lookup(ino, entry->d_name, &e);
+            if (err)
+                goto error;
             entsize = fuse_add_direntry_plus(req, p, rem, entry->d_name, &e, entry->d_off);
         } else {
             e.attr.st_ino = entry->d_ino;
@@ -778,7 +766,7 @@ static void do_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
         if (entsize > rem) {
             if (fs.debug)
                 cerr << "DEBUG: readdir(): buffer full, returning data. " << endl;
-            if (did_lookup)
+            if (plus)
                 forget_one(e.ino, 1);
             break;
         }
@@ -835,55 +823,6 @@ static void sfs_releasedir(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi) {
 }
 
 
-static void do_passthrough_open(fuse_req_t req, fuse_ino_t ino, int fd,
-                                fuse_file_info *fi) {
-    Inode& inode = get_inode(ino);
-    /* Setup a shared backing file on first open of an inode */
-    if (inode.backing_id) {
-        if (fs.debug)
-            cerr << "DEBUG: reusing shared backing file "
-                 << inode.backing_id << " for inode " << ino << endl;
-        fi->backing_id = inode.backing_id;
-    } else if (!(inode.backing_id = fuse_passthrough_open(req, fd))) {
-        cerr << "DEBUG: fuse_passthrough_open failed for inode " << ino
-             << ", disabling rw passthrough." << endl;
-        fs.passthrough = false;
-    } else {
-        if (fs.debug)
-            cerr << "DEBUG: setup shared backing file "
-                 << inode.backing_id << " for inode " << ino << endl;
-        fi->backing_id = inode.backing_id;
-    }
-    /* open in passthrough mode must drop old page cache */
-    if (fi->backing_id)
-        fi->keep_cache = false;
-}
-
-static void sfs_create_open_flags(fuse_file_info *fi)
-{
-    if (fs.direct_io)
-        fi->direct_io = 1;
-
-    /*
-     * fi->direct_io (FOPEN_DIRECT_IO) is set to benefit from
-     * parallel_direct_writes, which kernel cannot do for plain O_DIRECT.
-     * However, passthrough is preferred, but which is not possible when
-     * FOPEN_DIRECT_IO is set.
-     */
-    if (!fs.passthrough) {
-        if (fi->flags & O_DIRECT)
-            fi->direct_io = 1;
-    }
-
-    /* parallel_direct_writes feature depends on direct_io features.
-    To make parallel_direct_writes valid, need set fi->direct_io
-    in current function. */
-    fi->parallel_direct_writes = 1;
-
-    fi->keep_cache = (fs.timeout != 0);
-    fi->noflush = (fs.timeout == 0 && (fi->flags & O_ACCMODE) == O_RDONLY);
-}
-
 static void sfs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
                        mode_t mode, fuse_file_info *fi) {
     Inode& inode_p = get_inode(parent);
@@ -905,17 +844,15 @@ static void sfs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
         if (err == ENFILE || err == EMFILE)
             cerr << "ERROR: Reached maximum number of file descriptors." << endl;
         fuse_reply_err(req, err);
-        return;
+	return;
     }
+
+    if (fs.direct_io)
+	    fi->direct_io = 1;
 
     Inode& inode = get_inode(e.ino);
     lock_guard<mutex> g {inode.m};
     inode.nopen++;
-
-    sfs_create_open_flags(fi);
-
-    if (fs.passthrough)
-        do_passthrough_open(req, e.ino, fd, fi);
     fuse_reply_create(req, &e, fi);
 }
 
@@ -967,12 +904,13 @@ static void sfs_open(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi) {
 
     lock_guard<mutex> g {inode.m};
     inode.nopen++;
+    fi->keep_cache = (fs.timeout != 0);
+    fi->noflush = (fs.timeout == 0 && (fi->flags & O_ACCMODE) == O_RDONLY);
 
-    sfs_create_open_flags(fi);
+    if (fs.direct_io)
+	    fi->direct_io = 1;
 
     fi->fh = fd;
-    if (fs.passthrough)
-        do_passthrough_open(req, ino, fd, fi);
     fuse_reply_open(req, fi);
 }
 
@@ -981,19 +919,6 @@ static void sfs_release(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi) {
     Inode& inode = get_inode(ino);
     lock_guard<mutex> g {inode.m};
     inode.nopen--;
-
-    /* Close the shared backing file on last file close of an inode */
-    if (inode.backing_id && !inode.nopen) {
-        if (fuse_passthrough_close(req, inode.backing_id) < 0) {
-            cerr << "DEBUG: fuse_passthrough_close failed for inode "
-                 << ino << " backing file " << inode.backing_id << endl;
-        } else if (fs.debug) {
-            cerr << "DEBUG: closed backing file " << inode.backing_id
-                 << " for inode " << ino << endl;
-        }
-        inode.backing_id = 0;
-    }
-
     close(fi->fh);
     fuse_reply_err(req, 0);
 }
@@ -1019,27 +944,78 @@ static void sfs_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
 
 
 static void do_read(fuse_req_t req, size_t size, off_t off, fuse_file_info *fi) {
+    // --- Add logging here ---
+    std::string logFilePath = "/home/ywmei_google_com/Workspace/aosp_main/output_analyzer/logs/passthrough_hp.log";
 
-    fuse_bufvec buf = FUSE_BUFVEC_INIT(size);
-    buf.buf[0].flags = static_cast<fuse_buf_flags>(
-        FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK);
+	// Get epoch timestamp with milliseconds
+    auto enow = std::chrono::system_clock::now().time_since_epoch();
+    double epoch = std::chrono::duration<double, std::milli>(enow).count() / 1000.0;
+	// Convert epoch to string with desired precision
+    std::ostringstream oss_fuse_atime;
+    oss_fuse_atime << std::fixed << std::setprecision(7) << epoch;
+    std::string epoch_str = oss_fuse_atime.str();
+
+    time_t now = time(0);
+    char* dt = ctime(&now);
+
+    // Remove the newline character from ctime() output
+    size_t len = strlen(dt);
+    if (len > 0 && dt[len - 1] == '\n') {
+        dt[len - 1] = '\0';
+    }
+
+
+    std::ofstream logFile(logFilePath, std::ios_base::app);
+    if (logFile.is_open()) {
+
+		char filePath[PATH_MAX];
+		ssize_t len = readlink(("/proc/self/fd/" + std::to_string(fi->fh)).c_str(), filePath, sizeof(filePath) - 1);
+		if (len != -1) {
+			filePath[len] = '\0';
+			std::string prefix = "/home/ywmei_google_com/Workspace/fuse_mnt/out/";
+			std::string filePathStr(filePath);
+			if (strlen(filePath) >= prefix.size() && filePathStr.compare(0, prefix.size(), prefix) == 0) {
+				std::lock_guard<std::mutex> lock(loggedFilePathsMutex);
+				if (loggedFilePaths.find(filePathStr) == loggedFilePaths.end()){
+ 				loggedFilePaths.insert(filePathStr);
+				// Get the size of the hashset as a string
+				// std::string setSizeStr = std::to_string(loggedFilePaths.size());
+				// --- Get mtime ---
+                struct stat fileStat;
+                    if (stat(filePath, &fileStat) == 0) {
+                        auto mtime = fileStat.st_mtime;
+                        std::ostringstream oss_mtime;
+                        oss_mtime << std::fixed << std::setprecision(7) << static_cast<double>(mtime);
+                        std::string mtime_epoch_str = oss_mtime.str();
+
+                        logFile << "[" << dt << "]," << filePath << "," << epoch_str << "," << mtime_epoch_str << "\n";
+                    } else {
+                        // Handle stat() error
+                        logFile << "[" << dt << "]," << filePath << "," << epoch_str << "," << "error getting mtime\n";
+                    }
+				}
+			}
+		}
+        logFile.close();
+    } else {
+        std::cerr << "Error opening log file: " << logFilePath << std::endl;
+    }
+    // --- End of logging ---
+    // ... (rest of the existing code in do_read) ...
+	fuse_bufvec buf = FUSE_BUFVEC_INIT(size);
+    buf.buf[0].flags = static_cast<fuse_buf_flags>(FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK);
     buf.buf[0].fd = fi->fh;
     buf.buf[0].pos = off;
 
     fuse_reply_data(req, &buf, FUSE_BUF_COPY_FLAGS);
 }
 
+
 static void sfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
                      fuse_file_info *fi) {
     (void) ino;
-    if (fs.passthrough && !fs.direct_io) {
-        cerr << "ERROR: fuse_passthrough read failed." << endl;
-        fuse_reply_err(req, EIO);
-        return;
-    }
     do_read(req, size, off, fi);
 }
-
 
 static void do_write_buf(fuse_req_t req, size_t size, off_t off,
                          fuse_bufvec *in_buf, fuse_file_info *fi) {
@@ -1060,11 +1036,6 @@ static void do_write_buf(fuse_req_t req, size_t size, off_t off,
 static void sfs_write_buf(fuse_req_t req, fuse_ino_t ino, fuse_bufvec *in_buf,
                           off_t off, fuse_file_info *fi) {
     (void) ino;
-    if (fs.passthrough && !fs.direct_io) {
-        cerr << "ERROR: fuse_passthrough write failed." << endl;
-        fuse_reply_err(req, EIO);
-        return;
-    }
     auto size {fuse_buf_size(in_buf)};
     do_write_buf(req, size, off, in_buf, fi);
 }
@@ -1314,7 +1285,6 @@ static cxxopts::ParseResult parse_options(int argc, char **argv) {
         ("help", "Print help")
         ("nocache", "Disable attribute all caching")
         ("nosplice", "Do not use splice(2) to transfer data")
-        ("nopassthrough", "Do not use pass-through mode for read/write")
         ("single", "Run single-threaded")
         ("o", "Mount options (see mount.fuse(5) - only use if you know what "
               "you are doing)", cxxopts::value(mount_options))
@@ -1322,6 +1292,7 @@ static cxxopts::ParseResult parse_options(int argc, char **argv) {
                         cxxopts::value<int>()->default_value(SFS_DEFAULT_THREADS))
         ("clone-fd", "use separate fuse device fd for each thread")
         ("direct-io", "enable fuse kernel internal direct-io");
+
 
     // FIXME: Find a better way to limit the try clause to just
     // opt_parser.parse() (cf. https://github.com/jarro2783/cxxopts/issues/146)
@@ -1350,7 +1321,6 @@ static cxxopts::ParseResult parse_options(int argc, char **argv) {
         fs.foreground = true;
 
     fs.nosplice = options.count("nosplice") != 0;
-    fs.passthrough = options.count("nopassthrough") == 0;
     fs.num_threads = options["num-threads"].as<int>();
     fs.clone_fd = options.count("clone-fd");
     fs.direct_io = options.count("direct-io");
@@ -1439,7 +1409,6 @@ int main(int argc, char *argv[]) {
         (fs.debug_fuse && fuse_opt_add_arg(&args, "-odebug")))
         errx(3, "ERROR: Out of memory");
 
-    ret = -1;
     fuse_lowlevel_ops sfs_oper {};
     assign_operations(sfs_oper);
     auto se = fuse_session_new(&args, &sfs_oper, sizeof(sfs_oper), &fs);
@@ -1449,9 +1418,6 @@ int main(int argc, char *argv[]) {
     if (fuse_set_signal_handlers(se) != 0)
         goto err_out2;
 
-    if (fuse_set_fail_signal_handlers(se) != 0)
-        goto err_out2;
-
     // Don't apply umask, use modes exactly as specified
     umask(0);
 
@@ -1459,22 +1425,18 @@ int main(int argc, char *argv[]) {
     loop_config = fuse_loop_cfg_create();
 
     if (fs.num_threads != -1)
-        fuse_loop_cfg_set_max_threads(loop_config, fs.num_threads);
-
-    fuse_loop_cfg_set_clone_fd(loop_config, fs.clone_fd);
+        fuse_loop_cfg_set_idle_threads(loop_config, fs.num_threads);
 
     if (fuse_session_mount(se, argv[2]) != 0)
         goto err_out3;
 
     fuse_daemonize(fs.foreground);
 
-    if (!fs.foreground)
-        fuse_log_enable_syslog("passthrough-hp", LOG_PID | LOG_CONS, LOG_DAEMON);
-
     if (options.count("single"))
         ret = fuse_session_loop(se);
     else
         ret = fuse_session_loop_mt(se, loop_config);
+
 
     fuse_session_unmount(se);
 
@@ -1486,9 +1448,6 @@ err_out1:
 
     fuse_loop_cfg_destroy(loop_config);
     fuse_opt_free_args(&args);
-
-    if (!fs.foreground)
-        fuse_log_close_syslog();
 
     return ret ? 1 : 0;
 }
